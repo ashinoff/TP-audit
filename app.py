@@ -190,6 +190,70 @@ def norm_np(s) -> str:
     return str(s).lower().strip()
 
 
+# ═════════════════════════════════ ПОДБОР КАНДИДАТОВ ═════════════════════════════════
+
+def find_candidate_tps(
+    row,
+    current_tp,
+    *,
+    addr_tp: dict,
+    street_np_tp: dict,
+    tps_by_pod_feeder: dict,
+    tps_by_feeder: dict,
+    max_candidates: int = 3,
+) -> list[tuple[str, str]]:
+    """
+    Возвращает до `max_candidates` кортежей (tp_name, short_reason),
+    отсортированных по приоритету:
+        1. совпадение точного адреса (улица + дом) в этом же нас. пункте
+        2. совпадение улицы в том же нас. пункте на другой ТП
+        3. совпадение ПС + фидера абонента с доминирующими у ТП
+        4. совпадение только фидера (запасной вариант)
+    """
+    # (priority, secondary_sort, tp, reason)
+    pool: list[tuple[int, int, str, str]] = []
+
+    # P1 — точный адрес где-то ещё
+    if pd.notna(row["_street"]) and pd.notna(row["_house"]):
+        addr_c = addr_tp.get((row["_np"], row["_street"], row["_house"]), Counter())
+        for tp, n in addr_c.most_common():
+            if tp != current_tp and n >= 3:
+                pool.append((1, -n, tp, f"адрес ×{n}"))
+
+    # P2 — улица в том же нас. пункте
+    if pd.notna(row["_street"]):
+        street_c = street_np_tp.get((row["_street"], row["_np"]), Counter())
+        for tp, n in street_c.most_common():
+            if tp != current_tp and n >= 5:
+                pool.append((2, -n, tp, f"улица ×{n}"))
+
+    # P3 — ПС + фидер совпадают
+    if pd.notna(row["_pod"]) and pd.notna(row["_feeder"]):
+        for tp in tps_by_pod_feeder.get((row["_pod"], row["_feeder"]), []):
+            if tp != current_tp:
+                pool.append((3, 0, tp, "ПС и фидер совпадают"))
+
+    # P4 — только фидер
+    if pd.notna(row["_feeder"]):
+        for tp in tps_by_feeder.get(row["_feeder"], []):
+            if tp != current_tp:
+                pool.append((4, 0, tp, "фидер совпадает"))
+
+    pool.sort()
+
+    # Дедупликация — каждая ТП попадает один раз, с лучшим (наименьшим по приоритету) объяснением
+    seen: set = set()
+    out: list[tuple[str, str]] = []
+    for _prio, _sec, tp, reason in pool:
+        if tp in seen:
+            continue
+        seen.add(tp)
+        out.append((tp, reason))
+        if len(out) >= max_candidates:
+            break
+    return out
+
+
 # ═════════════════════════════════ АНАЛИЗ ═════════════════════════════════
 
 def analyze(
@@ -248,6 +312,15 @@ def analyze(
             "streets": Counter(sub["_street"].dropna()),
             "size": len(sub),
         }
+
+    # Индексы для подбора кандидатных ТП
+    tps_by_feeder: dict[str, list[str]] = defaultdict(list)
+    tps_by_pod_feeder: dict[tuple, list[str]] = defaultdict(list)
+    for tp, m in tp_modes.items():
+        if m["feeder_top"]:
+            tps_by_feeder[m["feeder_top"]].append(tp)
+            if m["pod_top"]:
+                tps_by_pod_feeder[(m["pod_top"], m["feeder_top"])].append(tp)
 
     signal_counts = Counter()
     records = []
@@ -320,28 +393,48 @@ def analyze(
                     signal_counts["Адрес"] += 1
 
         if score >= min_score:
-            rec = {
-                "Балл": score,
-                "ТП": tp,
-                "Причины": "; ".join(reasons),
-            }
+            # Подбираем кандидатные ТП
+            candidates = find_candidate_tps(
+                row, tp,
+                addr_tp=addr_tp,
+                street_np_tp=street_np_tp,
+                tps_by_pod_feeder=tps_by_pod_feeder,
+                tps_by_feeder=tps_by_feeder,
+            )
+            candidates_str = "; ".join(f"{c_tp} ({c_reason})" for c_tp, c_reason in candidates)
+
+            # Формируем запись в нужном порядке:
+            #   [инфо об абоненте] · Текущая ТП · Предлагаемая ТП · Причины · Балл
+            rec: dict = {}
+
+            # 1. Идентификационные поля абонента (только если есть в исходнике)
             for key in ("num", "ls", "contract", "tu_code", "tu_name"):
                 col = cols.get(key)
                 if col:
                     rec[col] = row[col]
-            for src_key, label in (
-                ("_np_raw", "Нас. пункт"),
-                ("_street_raw", "Улица"),
-                ("_house_raw", "Дом"),
-                ("_pod", "Подключение"),
-                ("_feeder", "Фидер"),
-            ):
-                rec[label] = row[src_key]
+
+            # 2. Адрес
+            rec["Нас. пункт"] = row["_np_raw"]
+            rec["Улица"] = row["_street_raw"]
+            rec["Дом"] = row["_house_raw"]
+
+            # 3. Текущие энергетические параметры абонента
+            rec["Подключение"] = row["_pod"]
+            rec["Фидер"] = row["_feeder"]
+
+            # 4. Текущая и предлагаемая ТП
+            rec["Текущая ТП"] = tp
+            rec["Предлагаемая ТП"] = candidates_str
+
+            # 5. Обоснование и итоговый балл
+            rec["Причины"] = "; ".join(reasons)
+            rec["Балл"] = score
+
             records.append(rec)
 
     result = pd.DataFrame(records)
     if not result.empty:
-        result = result.sort_values(["Балл", "ТП"], ascending=[False, True]).reset_index(drop=True)
+        result = result.sort_values(["Балл", "Текущая ТП"], ascending=[False, True]).reset_index(drop=True)
 
     summary = {
         "rows_total": len(df),
@@ -357,7 +450,7 @@ def per_tp_summary(result: pd.DataFrame) -> pd.DataFrame:
     if result.empty:
         return pd.DataFrame()
     return (
-        result.groupby("ТП")
+        result.groupby("Текущая ТП")
         .agg(
             Подозрительных=("Балл", "size"),
             Сумма_баллов=("Балл", "sum"),
@@ -767,7 +860,7 @@ def main() -> None:
             min_show = st.slider("Балл от", min_score, 200, min_score, step=5, key="min_show")
         view = result.copy()
         if tp_filter:
-            view = view[view["ТП"].astype(str).str.contains(tp_filter, case=False, na=False)]
+            view = view[view["Текущая ТП"].astype(str).str.contains(tp_filter, case=False, na=False)]
         view = view[view["Балл"] >= min_show]
         st.dataframe(view, hide_index=True, use_container_width=True, height=500)
 
