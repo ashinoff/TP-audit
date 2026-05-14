@@ -184,6 +184,31 @@ def norm_house(h) -> Optional[str]:
     return s or None
 
 
+def parse_house_int(h) -> Optional[int]:
+    """
+    Извлекает целое число из обозначения дома.
+    Примеры: "5" → 5, "5а" → 5, "10/2" → 10, "23:49:0402030:507" → None
+    (кадастровые номера и слишком большие числа отсеиваются).
+    """
+    if pd.isna(h):
+        return None
+    s = str(h).strip()
+    # Если в строке есть символ ":" — это, скорее всего, кадастровый номер
+    if ":" in s:
+        return None
+    m = re.match(r"\s*(\d+)", s)
+    if not m:
+        return None
+    try:
+        n = int(m.group(1))
+    except ValueError:
+        return None
+    # Разумный диапазон номера дома — отсеиваем мусор
+    if 1 <= n <= 9999:
+        return n
+    return None
+
+
 def norm_np(s) -> str:
     if pd.isna(s):
         return ""
@@ -191,6 +216,54 @@ def norm_np(s) -> str:
 
 
 # ═════════════════════════════════ ПОДБОР КАНДИДАТОВ ═════════════════════════════════
+
+def find_bracketing_tps(
+    house_int: Optional[int],
+    street: Optional[str],
+    np_val: str,
+    current_tp,
+    *,
+    houses_by_street_np_tp: dict,
+    min_houses_on_other: int = 3,
+    max_neighbor_distance: int = 15,
+) -> list[tuple]:
+    """
+    Ищет ТП, у которых дом абонента «зажат» между их домами на той же улице.
+
+    Возвращает [(tp, below, above, n_houses, total_distance), …] где
+        below — ближайший дом ≤ house_int на этой ТП
+        above — ближайший дом ≥ house_int
+        n_houses — сколько всего домов этой улицы на той ТП
+        total_distance — сумма расстояний до ближайших соседей (для ранжирования)
+    """
+    if house_int is None or street is None:
+        return []
+    out = []
+    # Перебираем все (street, np, tp) с подходящей улицей в текущем нас. пункте
+    for (s, n, tp_other), houses in houses_by_street_np_tp.items():
+        if s != street or n != np_val or tp_other == current_tp:
+            continue
+        if len(houses) < min_houses_on_other:
+            continue
+        below = [h for h in houses if h <= house_int]
+        above = [h for h in houses if h >= house_int]
+        if not below or not above:
+            continue
+        closest_below = max(below)
+        closest_above = min(above)
+        # Точное совпадение считаем «слишком близко» — это уже сигнал 5
+        if closest_below == house_int or closest_above == house_int:
+            continue
+        # Хотя бы один сосед должен быть в пределах max_neighbor_distance
+        nearest = min(house_int - closest_below, closest_above - house_int)
+        if nearest > max_neighbor_distance:
+            continue
+        total_distance = (house_int - closest_below) + (closest_above - house_int)
+        out.append((tp_other, closest_below, closest_above, len(houses), total_distance))
+    # Сортируем: чем меньше суммарное расстояние и чем больше домов — тем лучше
+    out.sort(key=lambda x: (x[4], -x[3]))
+    return out
+
 
 def find_candidate_tps(
     row,
@@ -200,15 +273,17 @@ def find_candidate_tps(
     street_np_tp: dict,
     tps_by_pod_feeder: dict,
     tps_by_feeder: dict,
+    houses_by_street_np_tp: dict,
     max_candidates: int = 3,
 ) -> list[tuple[str, str]]:
     """
     Возвращает до `max_candidates` кортежей (tp_name, short_reason),
     отсортированных по приоритету:
         1. совпадение точного адреса (улица + дом) в этом же нас. пункте
-        2. совпадение улицы в том же нас. пункте на другой ТП
-        3. совпадение ПС + фидера абонента с доминирующими у ТП
-        4. совпадение только фидера (запасной вариант)
+        2. дом «зажат» соседями на другой ТП по этой улице
+        3. совпадение улицы в том же нас. пункте на другой ТП
+        4. совпадение ПС + фидера абонента с доминирующими у ТП
+        5. совпадение только фидера (запасной вариант)
     """
     # (priority, secondary_sort, tp, reason)
     pool: list[tuple[int, int, str, str]] = []
@@ -220,24 +295,34 @@ def find_candidate_tps(
             if tp != current_tp and n >= 3:
                 pool.append((1, -n, tp, f"адрес ×{n}"))
 
-    # P2 — улица в том же нас. пункте
+    # P2 — дом «зажат» соседями на другой ТП
+    house_int = row.get("_house_int")
+    if pd.notna(row["_street"]) and house_int is not None:
+        brackets = find_bracketing_tps(
+            house_int, row["_street"], row["_np"], current_tp,
+            houses_by_street_np_tp=houses_by_street_np_tp,
+        )
+        for tp_other, below, above, _n, _dist in brackets:
+            pool.append((2, _dist, tp_other, f"между домами №{int(below)} и №{int(above)}"))
+
+    # P3 — улица в том же нас. пункте
     if pd.notna(row["_street"]):
         street_c = street_np_tp.get((row["_street"], row["_np"]), Counter())
         for tp, n in street_c.most_common():
             if tp != current_tp and n >= 5:
-                pool.append((2, -n, tp, f"улица ×{n}"))
+                pool.append((3, -n, tp, f"улица ×{n}"))
 
-    # P3 — ПС + фидер совпадают
+    # P4 — ПС + фидер совпадают
     if pd.notna(row["_pod"]) and pd.notna(row["_feeder"]):
         for tp in tps_by_pod_feeder.get((row["_pod"], row["_feeder"]), []):
             if tp != current_tp:
-                pool.append((3, 0, tp, "ПС и фидер совпадают"))
+                pool.append((4, 0, tp, "ПС и фидер совпадают"))
 
-    # P4 — только фидер
+    # P5 — только фидер
     if pd.notna(row["_feeder"]):
         for tp in tps_by_feeder.get(row["_feeder"], []):
             if tp != current_tp:
-                pool.append((4, 0, tp, "фидер совпадает"))
+                pool.append((5, 0, tp, "фидер совпадает"))
 
     pool.sort()
 
@@ -254,6 +339,57 @@ def find_candidate_tps(
     return out
 
 
+def _humanize_reason(reason_short: str) -> str:
+    """Переводит компактный маркер кандидата в человеческий вид."""
+
+    def _plural(n: int) -> str:
+        """Корректное склонение слова «абонент» для русского числительного."""
+        n = abs(n) % 100
+        if 11 <= n <= 14:
+            return "абонентов"
+        n %= 10
+        if n == 1:
+            return "абонент"
+        if 2 <= n <= 4:
+            return "абонента"
+        return "абонентов"
+
+    if reason_short.startswith("адрес ×"):
+        n = int(reason_short.replace("адрес ×", ""))
+        return f"там уже {n} {_plural(n)} с тем же адресом"
+    if reason_short.startswith("улица ×"):
+        n = int(reason_short.replace("улица ×", ""))
+        return f"там {n} {_plural(n)} с этой улицы"
+    if reason_short.startswith("между домами"):
+        return f"его номер дома {reason_short.replace('между домами', 'попадает между домами')} на этой ТП"
+    if reason_short == "ПС и фидер совпадают":
+        return "та же питающая ПС и тот же фидер — физически подходит"
+    if reason_short == "фидер совпадает":
+        return "тот же фидер"
+    return reason_short
+
+
+def format_candidates_humanized(candidates: list[tuple[str, str]]) -> str:
+    """
+    Преобразует список кандидатов в человеческое описание:
+        - 1 кандидат:    «Скорее всего привязать к ТП-X — <причина>.»
+        - 2-3 кандидата: «Скорее всего ТП-X — <причина>. Также возможно: ТП-Y (<причина>); ТП-Z (<причина>).»
+    """
+    if not candidates:
+        return "Не удалось подобрать кандидатную ТП — проверьте вручную."
+
+    first_tp, first_reason = candidates[0]
+    head = f"Скорее всего привязать к {first_tp} — {_humanize_reason(first_reason)}"
+
+    if len(candidates) == 1:
+        return head + "."
+
+    alts = []
+    for tp, reason in candidates[1:]:
+        alts.append(f"{tp} ({_humanize_reason(reason)})")
+    return head + ". Менее уверенные варианты: " + "; ".join(alts) + "."
+
+
 # ═════════════════════════════════ АНАЛИЗ ═════════════════════════════════
 
 def analyze(
@@ -267,6 +403,7 @@ def analyze(
     weight_np: int = 20,
     weight_street_orphan: int = 25,
     weight_addr_home: int = 30,
+    weight_house_range: int = 25,
     np_dominance_threshold: float = 0.8,
 ) -> tuple[pd.DataFrame, dict]:
     if not cols.get("tp"):
@@ -283,9 +420,11 @@ def analyze(
     df["_np"] = df["_np_raw"].apply(norm_np)
     df["_street"] = df["_street_raw"].apply(norm_street)
     df["_house"] = df["_house_raw"].apply(norm_house)
+    df["_house_int"] = df["_house_raw"].apply(parse_house_int)
 
     street_np_tp: dict[tuple, Counter] = defaultdict(Counter)
     addr_tp: dict[tuple, Counter] = defaultdict(Counter)
+    houses_by_street_np_tp: dict[tuple, list[int]] = defaultdict(list)
 
     for _, row in df.iterrows():
         tp = row["_tp"]
@@ -295,6 +434,12 @@ def analyze(
             street_np_tp[(row["_street"], row["_np"])][tp] += 1
         if pd.notna(row["_street"]) and pd.notna(row["_house"]):
             addr_tp[(row["_np"], row["_street"], row["_house"])][tp] += 1
+        if pd.notna(row["_street"]) and row["_house_int"] is not None:
+            houses_by_street_np_tp[(row["_street"], row["_np"], tp)].append(row["_house_int"])
+
+    # Сортируем списки домов для быстрой работы алгоритма «зажат»
+    for key in houses_by_street_np_tp:
+        houses_by_street_np_tp[key].sort()
 
     tp_modes: dict[str, dict] = {}
     for tp, sub in df.groupby("_tp"):
@@ -304,11 +449,24 @@ def analyze(
         pod_top = sub["_pod"].mode()
         np_top = sub["_np"].mode()
         np_top_val = np_top.iloc[0] if not np_top.empty else ""
+        pod_top_val = pod_top.iloc[0] if not pod_top.empty else None
+        feeder_top_val = feeder_top.iloc[0] if not feeder_top.empty else None
+        # Берём первое оригинальное написание, соответствующее нормализованному np_top
+        np_top_display = ""
+        if np_top_val:
+            matching = sub.loc[sub["_np"] == np_top_val, "_np_raw"]
+            if not matching.empty:
+                first_raw = matching.dropna()
+                if not first_raw.empty:
+                    np_top_display = str(first_raw.iloc[0])
         tp_modes[tp] = {
-            "feeder_top": feeder_top.iloc[0] if not feeder_top.empty else None,
-            "pod_top": pod_top.iloc[0] if not pod_top.empty else None,
+            "feeder_top": feeder_top_val,
+            "pod_top": pod_top_val,
             "np_top": np_top_val,
+            "np_top_display": np_top_display,
             "np_share": (sub["_np"] == np_top_val).mean() if np_top_val else 0.0,
+            "pod_n": int((sub["_pod"] == pod_top_val).sum()) if pod_top_val else 0,
+            "feeder_n": int((sub["_feeder"] == feeder_top_val).sum()) if feeder_top_val else 0,
             "streets": Counter(sub["_street"].dropna()),
             "size": len(sub),
         }
@@ -338,12 +496,20 @@ def analyze(
 
         if pd.notna(row["_pod"]) and m["pod_top"] and row["_pod"] != m["pod_top"]:
             score += weight_pod
-            reasons.append(f"ПС «{row['_pod']}» ≠ «{m['pod_top']}» (норма на ТП)")
+            reasons.append(
+                f"Питающая ПС не сходится: у абонента указана «{row['_pod']}», "
+                f"а у {m['pod_n']} из {m['size']} абонентов этой ТП — «{m['pod_top']}». "
+                f"Питающая подстанция у одной ТП должна быть одна — это ошибка в данных."
+            )
             signal_counts["ПС"] += 1
 
         if pd.notna(row["_feeder"]) and m["feeder_top"] and row["_feeder"] != m["feeder_top"]:
             score += weight_feeder
-            reasons.append(f"Фидер «{row['_feeder']}» ≠ «{m['feeder_top']}» (норма на ТП)")
+            reasons.append(
+                f"Фидер не сходится: у абонента «{row['_feeder']}», "
+                f"а у {m['feeder_n']} из {m['size']} абонентов этой ТП — «{m['feeder_top']}». "
+                f"Одна ТП питается одним фидером — физически невозможно."
+            )
             signal_counts["Фидер"] += 1
 
         if (
@@ -353,9 +519,11 @@ def analyze(
             and m["np_share"] >= np_dominance_threshold
         ):
             score += weight_np
+            np_dom_display = m["np_top_display"] or m["np_top"]
             reasons.append(
-                f"Нас. пункт «{row['_np_raw']}» (на ТП доминирует «{m['np_top']}», "
-                f"{m['np_share']:.0%})"
+                f"Адрес в населённом пункте «{row['_np_raw']}», но {m['np_share']:.0%} "
+                f"абонентов этой ТП находятся в «{np_dom_display}». Похоже, нас. пункт "
+                f"или ТП указаны с ошибкой — это разные территории."
             )
             signal_counts["Нас.пункт"] += 1
 
@@ -372,8 +540,9 @@ def analyze(
                     if best_other_n >= 5 and dominant_count_here >= 5:
                         score += weight_street_orphan
                         reasons.append(
-                            f"Улица «{row['_street_raw']}» — 1 абонент на ТП, "
-                            f"но {best_other_n} на «{best_other_tp}»"
+                            f"Из всех абонентов этой ТП только этот один — с улицы «{row['_street_raw']}» "
+                            f"({row['_np_raw']}). При этом на ТП «{best_other_tp}» с той же улицы — "
+                            f"{best_other_n} абонентов. Похоже, наш попал на эту ТП по ошибке."
                         )
                         signal_counts["Улица-одиночка"] += 1
 
@@ -385,12 +554,35 @@ def analyze(
                 best_tp, best_n = tps_for_addr.most_common(1)[0]
                 if best_tp != tp and best_n >= 3:
                     score += weight_addr_home
+                    others_count = total_at_addr - here_at_addr - best_n
+                    tail = (
+                        f", ещё {others_count} распределены иначе"
+                        if others_count > 0 else ""
+                    )
                     reasons.append(
-                        f"Адрес «{row['_street_raw']} {row['_house_raw']}» — здесь "
-                        f"{here_at_addr} из {total_at_addr}, преобладает ТП «{best_tp}» "
-                        f"({best_n})"
+                        f"По адресу «{row['_street_raw']} {row['_house_raw']}» в выгрузке "
+                        f"{total_at_addr} абонентов: {best_n} сидят на ТП «{best_tp}»{tail}, "
+                        f"и только этот один — на текущей ТП. Соседи по дому привязаны "
+                        f"к другой подстанции."
                     )
                     signal_counts["Адрес"] += 1
+
+        # Сигнал 6 — номер дома «зажат» между домами на другой ТП по этой улице
+        if pd.notna(row["_street"]) and row["_house_int"] is not None:
+            brackets = find_bracketing_tps(
+                row["_house_int"], row["_street"], row["_np"], tp,
+                houses_by_street_np_tp=houses_by_street_np_tp,
+            )
+            if brackets:
+                score += weight_house_range
+                best_tp_other, below, above, n_houses, _dist = brackets[0]
+                reasons.append(
+                    f"Дом №{int(row['_house_int'])} на улице «{row['_street_raw']}» "
+                    f"({row['_np_raw']}) попадает в диапазон ТП «{best_tp_other}»: "
+                    f"она держит здесь {n_houses} домов, ближайшие — №{int(below)} и №{int(above)}. "
+                    f"По нумерации этот адрес должен быть на той же ТП."
+                )
+                signal_counts["Дом-диапазон"] += 1
 
         if score >= min_score:
             # Подбираем кандидатные ТП
@@ -400,8 +592,9 @@ def analyze(
                 street_np_tp=street_np_tp,
                 tps_by_pod_feeder=tps_by_pod_feeder,
                 tps_by_feeder=tps_by_feeder,
+                houses_by_street_np_tp=houses_by_street_np_tp,
             )
-            candidates_str = "; ".join(f"{c_tp} ({c_reason})" for c_tp, c_reason in candidates)
+            candidates_str = format_candidates_humanized(candidates)
 
             # Формируем запись в нужном порядке:
             #   [инфо об абоненте] · Текущая ТП · Предлагаемая ТП · Причины · Балл
@@ -481,6 +674,7 @@ def make_xlsx_bytes(result: pd.DataFrame, summary: dict, tp_agg: pd.DataFrame) -
             ("— по сигналу «Нас.пункт»", sig.get("Нас.пункт", 0)),
             ("— по сигналу «Улица-одиночка»", sig.get("Улица-одиночка", 0)),
             ("— по сигналу «Адрес»", sig.get("Адрес", 0)),
+            ("— по сигналу «Дом-диапазон»", sig.get("Дом-диапазон", 0)),
         ]
         pd.DataFrame(stats_rows, columns=["Показатель", "Значение"]).to_excel(
             writer, sheet_name="Статистика", index=False
@@ -730,6 +924,8 @@ def render_landing_help() -> None:
                  "Логика": "Улица единственная на ТП, но имеет «домашнюю» ТП в этом же нас. пункте."},
                 {"Сигнал": "Адрес", "Балл": 30,
                  "Логика": "Связка «улица + дом» в основном относится к другой ТП."},
+                {"Сигнал": "Дом", "Балл": 25,
+                 "Логика": "Номер дома попадает в диапазон домов другой ТП на этой улице."},
             ]
         )
         st.dataframe(method, hide_index=True, use_container_width=True)
@@ -764,6 +960,7 @@ def main() -> None:
             w_np = st.number_input("Нас. пункт", 0, 200, 20, step=5)
             w_street = st.number_input("Улица-одиночка", 0, 200, 25, step=5)
             w_addr = st.number_input("Адрес у другой ТП", 0, 200, 30, step=5)
+            w_house_range = st.number_input("Дом в диапазоне", 0, 200, 25, step=5)
 
     st.markdown('<hr class="pa-divider">', unsafe_allow_html=True)
 
@@ -827,6 +1024,7 @@ def main() -> None:
                 weight_np=w_np,
                 weight_street_orphan=w_street,
                 weight_addr_home=w_addr,
+                weight_house_range=w_house_range,
                 np_dominance_threshold=np_dom,
             )
         except Exception as exc:
